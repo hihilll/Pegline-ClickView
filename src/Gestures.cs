@@ -102,7 +102,7 @@ namespace Pegline
                 e.Handled = true;
                 endPress();
                 target.ReleaseMouseCapture();
-                if (down != null && !startedDrag && !didLongPress) line.Copy(id);
+                if (down != null && !startedDrag && !didLongPress) Click(line, id);
                 down = null;
                 didLongPress = false;
             };
@@ -114,6 +114,18 @@ namespace Pegline
                 e.Handled = true;
                 ShowMenu(target, line, id);
             };
+        }
+
+        /// A single click copies by default. "clickAction=open" makes it view
+        /// the photo instead, for people who reach for the picture itself.
+        /// Double click always opens, and a note still copies its text: an
+        /// image viewer has nothing to show for one.
+        static void Click(Line line, Guid id)
+        {
+            var item = line.Find(id);
+            if (item == null) return;
+            if (Settings.GetString("clickAction") == "open" && !item.IsNote) line.Open(id);
+            else line.Copy(id);
         }
 
         static void Drag(FrameworkElement source, CardView card, Line line)

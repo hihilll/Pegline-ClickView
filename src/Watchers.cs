@@ -29,11 +29,16 @@ namespace Pegline
             { ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff" };
         static readonly HashSet<string> excluded = new HashSet<string> { "thumbs.db", "desktop.ini", ".ds_store" };
 
-        public ScreenshotWatcher(string folder, Action<string> onNew, Action onChange)
+        /// Extra folders belong to other capture tools, which often file
+        /// their shots away by date; the Windows folder itself stays flat.
+        readonly bool recurse;
+
+        public ScreenshotWatcher(string folder, Action<string> onNew, Action onChange, bool recurse = false)
         {
             Folder = folder;
             this.onNew = onNew;
             this.onChange = onChange;
+            this.recurse = recurse;
             // A screenshot is written to a temp name and renamed, or written
             // in several chunks; give it a moment.
             pending.Interval = TimeSpan.FromSeconds(0.25);
@@ -69,7 +74,7 @@ namespace Pegline
             Scan();
             try
             {
-                fsw = new FileSystemWatcher(Folder) { IncludeSubdirectories = false, NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size };
+                fsw = new FileSystemWatcher(Folder) { IncludeSubdirectories = recurse, NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size };
                 FileSystemEventHandler h = delegate { Schedule(); };
                 fsw.Created += h;
                 fsw.Changed += h;
@@ -117,13 +122,33 @@ namespace Pegline
         {
             try
             {
-                return Directory.GetFiles(Folder)
+                return EnumFiles(Folder, recurse)
                     .Where(f => imageExtensions.Contains(Path.GetExtension(f))
                                 && !excluded.Contains(Path.GetFileName(f).ToLowerInvariant())
                                 && (File.GetAttributes(f) & FileAttributes.Hidden) == 0)
                     .OrderBy(CreationTime).ToList();
             }
             catch (Exception) { return new List<string>(); }
+        }
+
+        /// AllDirectories throws away the whole listing if one subfolder is
+        /// unreadable. Walk it by hand instead, so a single locked folder
+        /// never silently stops the watching.
+        static IEnumerable<string> EnumFiles(string root, bool recurse)
+        {
+            if (!recurse) return Directory.GetFiles(root);
+            var found = new List<string>();
+            var stack = new Stack<string>();
+            stack.Push(root);
+            while (stack.Count > 0)
+            {
+                string dir = stack.Pop();
+                try { found.AddRange(Directory.GetFiles(dir)); }
+                catch (Exception) { continue; }
+                try { foreach (var sub in Directory.GetDirectories(dir)) stack.Push(sub); }
+                catch (Exception) { }
+            }
+            return found;
         }
 
         static DateTime CreationTime(string f)
@@ -316,9 +341,15 @@ namespace Pegline
                     var data = Clipboard.GetDataObject();
                     if (data == null) return;
                     // Only a bare image is a screenshot. A picture copied in a
-                    // browser or a document comes with HTML, text or a file.
-                    if (data.GetDataPresent(DataFormats.Html) || data.GetDataPresent(DataFormats.UnicodeText)
-                        || data.GetDataPresent(DataFormats.FileDrop) || data.GetDataPresent(DataFormats.Rtf))
+                    // browser or a document carries HTML or rich text, and that
+                    // stays refused in every mode. Capture tools such as QQ and
+                    // WeChat often attach the saved file path or a plain text
+                    // label to a real screenshot, so "catchLoose" stops refusing
+                    // those two. Copying a file in Explorer still does nothing:
+                    // it carries no bitmap, so there is no image to hang.
+                    if (data.GetDataPresent(DataFormats.Html) || data.GetDataPresent(DataFormats.Rtf)) return;
+                    if (!Settings.Get("catchLoose")
+                        && (data.GetDataPresent(DataFormats.UnicodeText) || data.GetDataPresent(DataFormats.FileDrop)))
                         return;
                     if (data.GetDataPresent("PNG"))
                     {
