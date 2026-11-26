@@ -325,10 +325,29 @@ namespace Pegline
             }
         }
 
+        /// Opens the photo for viewing. The tray menu can name a viewer; with
+        /// none chosen the file goes to whatever Windows associates with it.
         public void Open(Guid id)
         {
             var item = Find(id);
             if (item == null) return;
+            string viewer = Settings.GetString("viewerPath");
+            if (!string.IsNullOrEmpty(viewer))
+            {
+                if (File.Exists(viewer))
+                {
+                    // A viewer that takes the file as its first argument, which
+                    // is every viewer the file dialog lets you pick.
+                    try
+                    {
+                        Process.Start(new ProcessStartInfo(viewer, "\"" + item.Path + "\"") { UseShellExecute = true });
+                        return;
+                    }
+                    catch (Exception) { }
+                }
+                // A viewer moved or uninstalled should not silence the click.
+                Settings.SetString("viewerPath", "");
+            }
             try { Process.Start(new ProcessStartInfo(item.Path) { UseShellExecute = true }); }
             catch (Exception) { System.Media.SystemSounds.Beep.Play(); }
         }

@@ -19,6 +19,8 @@ namespace Pegline
         readonly HoverPreview preview;
         readonly Forms.NotifyIcon tray = new Forms.NotifyIcon();
         ScreenshotWatcher watcher;
+        /// Folders belonging to other capture tools, on top of Windows' own.
+        readonly List<ScreenshotWatcher> extraWatchers = new List<ScreenshotWatcher>();
         readonly ClipboardCatcher catcher;
         readonly DispatcherTimer mouseTimer = new DispatcherTimer(DispatcherPriority.Render);
         IntPtr mouseHook;
@@ -92,6 +94,7 @@ namespace Pegline
             LoadKey(ClipboardCatcher.SnipKeyId, "snipKey", Shortcut.DefaultSnip);
             LoadKey(ClipboardCatcher.NoteKeyId, "noteKey", Shortcut.DefaultNote);
             StartWatcher();
+            StartExtraWatchers();
             SetUpTray();
             WatchBandClicks();
 
@@ -153,6 +156,8 @@ namespace Pegline
             if (mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(mouseHook);
             catcher.Dispose();
             if (watcher != null) watcher.Stop();
+            foreach (var w in extraWatchers) w.Stop();
+            extraWatchers.Clear();
             tray.Visible = false;
             tray.Dispose();
         }
@@ -169,6 +174,55 @@ namespace Pegline
                 WatchCapture(path, CaptureArea.Guess((int)size.Width, (int)size.Height, Native.GetForegroundWindow(), false));
             }, line.Prune);
             watcher.Start();
+        }
+
+        /// Folders the user added, kept in one setting so the ini stays flat.
+        static string[] ExtraFolders
+        {
+            get
+            {
+                string raw = Settings.GetString("watchFolders");
+                if (string.IsNullOrEmpty(raw)) return new string[0];
+                return raw.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries);
+            }
+        }
+
+        /// Other tools' shots hang the same way as Windows' own, but the file
+        /// stays where the tool put it: discarding only takes it off the line.
+        void StartExtraWatchers()
+        {
+            foreach (var w in extraWatchers) w.Stop();
+            extraWatchers.Clear();
+            foreach (var folder in ExtraFolders)
+            {
+                var w = new ScreenshotWatcher(folder, path => WatchCapture(path, null), line.Prune, true);
+                extraWatchers.Add(w);
+                w.Start();
+            }
+        }
+
+        void AddWatchFolder()
+        {
+            using (var dialog = new Forms.FolderBrowserDialog())
+            {
+                dialog.Description = Loc.L("Choose the folder your capture tool saves into",
+                                           "Elige la carpeta donde tu herramienta guarda las capturas",
+                                           "选择截图软件的保存目录");
+                dialog.ShowNewFolderButton = true;
+                if (dialog.ShowDialog() != Forms.DialogResult.OK) return;
+                var folders = new List<string>(ExtraFolders);
+                if (folders.Any(f => string.Equals(f, dialog.SelectedPath, StringComparison.OrdinalIgnoreCase))) return;
+                folders.Add(dialog.SelectedPath);
+                Settings.SetString("watchFolders", string.Join("|", folders.ToArray()));
+                StartExtraWatchers();
+            }
+        }
+
+        void RemoveWatchFolder(string folder)
+        {
+            var folders = ExtraFolders.Where(f => !string.Equals(f, folder, StringComparison.OrdinalIgnoreCase)).ToArray();
+            Settings.SetString("watchFolders", string.Join("|", folders));
+            StartExtraWatchers();
         }
 
         void SetCatching(bool on)
@@ -668,6 +722,25 @@ namespace Pegline
             });
         }
 
+        /// Pick the exe that viewing a photo should use. An empty setting
+        /// means the Windows association, which is also how you go back.
+        void ChooseViewer()
+        {
+            using (var dialog = new Forms.OpenFileDialog())
+            {
+                dialog.Title = Loc.L("Choose your image viewer", "Elige tu visor de imágenes", "选择看图软件");
+                dialog.Filter = Loc.L("Programs (*.exe)|*.exe|All files (*.*)|*.*",
+                                      "Programas (*.exe)|*.exe|Todos los archivos (*.*)|*.*",
+                                      "程序 (*.exe)|*.exe|所有文件 (*.*)|*.*");
+                dialog.CheckFileExists = true;
+                string current = Settings.GetString("viewerPath");
+                if (!string.IsNullOrEmpty(current) && File.Exists(current)) dialog.FileName = current;
+                else dialog.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+                if (dialog.ShowDialog() == Forms.DialogResult.OK)
+                    Settings.SetString("viewerPath", dialog.FileName);
+            }
+        }
+
         // Tray icon
 
         void SetUpTray()
@@ -723,12 +796,81 @@ namespace Pegline
                                          "Las capturas de Win+Mayús+S e ImprPant se cuelgan al instante",
                                          "Win+Shift+S 和 PrtScn 的截图立刻挂上，不落到桌面");
 
+            // QQ, WeChat and friends attach a file path or a text label to a
+            // genuine capture; the strict reading would refuse those.
+            var loose = add(Loc.L("Catch shots from other apps (QQ, WeChat…)", "Capturas de otras apps (QQ, WeChat…)", "兼容其他截图软件（QQ、微信等）"),
+                            () =>
+                            {
+                                bool on = !Settings.Get("catchLoose");
+                                Settings.Set("catchLoose", on);
+                                // A looser filter is pointless while the
+                                // clipboard itself is not being read.
+                                if (on) SetCatching(true);
+                            });
+            loose.Checked = Settings.Get("catchLoose");
+            loose.ToolTipText = Loc.L(
+                "Accepts captures that also carry a file path or a text label. Needs Handle screenshots on.",
+                "Acepta capturas con ruta de archivo o texto. Requiere activar Encargarse de las capturas.",
+                "接受同时带文件路径或文字的截图，需先开启「接管截图」。浏览器和文档里复制的图片仍不会挂。");
+
+            var watchMenu = new Forms.ToolStripMenuItem(Loc.L("Other screenshot folders", "Otras carpetas de capturas", "监听其他截图文件夹"));
+            var addFolder = new Forms.ToolStripMenuItem(Loc.L("Add a folder…", "Añadir una carpeta…", "添加文件夹…"));
+            addFolder.Click += delegate { AddWatchFolder(); };
+            watchMenu.DropDownItems.Add(addFolder);
+            string[] extra = ExtraFolders;
+            if (extra.Length > 0) watchMenu.DropDownItems.Add(new Forms.ToolStripSeparator());
+            foreach (var folder in extra)
+            {
+                string target = folder;
+                var item = new Forms.ToolStripMenuItem(Loc.L("Stop watching: ", "Dejar de vigilar: ", "不再监听：") + target);
+                item.Click += delegate { RemoveWatchFolder(target); };
+                watchMenu.DropDownItems.Add(item);
+            }
+            watchMenu.ToolTipText = Loc.L(
+                "New images other tools save here hang too, subfolders included",
+                "Las imágenes nuevas de otras herramientas también se cuelgan, incluidas las subcarpetas",
+                "其他截图软件保存到这里的图片也会挂上（含子文件夹）。只挂新图，不动已有文件");
+            menu.Items.Add(watchMenu);
+
             add(Loc.L("Open screenshots folder", "Abrir carpeta de capturas", "打开截图文件夹"), () =>
             {
                 string folder = CatchClipboard ? Line.InboxFolder : watcher.Folder;
                 Directory.CreateDirectory(folder);
                 Process.Start("explorer.exe", "\"" + folder + "\"");
             });
+
+            // What a single click does. Copying stays the default; viewing is
+            // for people who click a photo expecting to see it larger.
+            string clickAction = Settings.GetString("clickAction") ?? "copy";
+            var clickMenu = new Forms.ToolStripMenuItem(Loc.L("Click a photo to", "Al hacer clic en una foto", "单击图片"));
+            Action<string, string> clickChoice = (value, title) =>
+            {
+                var choice = new Forms.ToolStripMenuItem(title) { Checked = clickAction == value };
+                choice.Click += delegate { Settings.SetString("clickAction", value); };
+                clickMenu.DropDownItems.Add(choice);
+            };
+            clickChoice("copy", Loc.L("Copy it (default)", "Copiarla (predeterminado)", "复制图片（默认）"));
+            clickChoice("open", Loc.L("View it in the image viewer", "Verla en el visor de imágenes", "用看图软件查看"));
+            clickMenu.ToolTipText = Loc.L("Double click always views; press and hold still edits",
+                                          "El doble clic siempre abre; mantener pulsado sigue editando",
+                                          "双击始终查看，长按仍是编辑");
+            menu.Items.Add(clickMenu);
+
+            string viewer = Settings.GetString("viewerPath");
+            var viewerMenu = new Forms.ToolStripMenuItem(Loc.L("Image viewer", "Visor de imágenes", "看图软件"));
+            var shell = new Forms.ToolStripMenuItem(Loc.L("Windows default", "Predeterminado de Windows", "系统默认（跟随 Windows 图片关联）"))
+            { Checked = string.IsNullOrEmpty(viewer) };
+            shell.Click += delegate { Settings.SetString("viewerPath", ""); };
+            viewerMenu.DropDownItems.Add(shell);
+            var choose = new Forms.ToolStripMenuItem(Loc.L("Choose a program…", "Elegir un programa…", "选择程序…"));
+            choose.Click += delegate { ChooseViewer(); };
+            viewerMenu.DropDownItems.Add(choose);
+            if (!string.IsNullOrEmpty(viewer))
+                viewerMenu.DropDownItems.Add(new Forms.ToolStripMenuItem(viewer) { Enabled = false });
+            viewerMenu.ToolTipText = Loc.L("Used by viewing a photo, by single or double click",
+                                           "Se usa al ver una foto, con clic simple o doble",
+                                           "单击或双击查看图片时使用");
+            menu.Items.Add(viewerMenu);
 
             menu.Items.Add(new Forms.ToolStripSeparator());
             add(Loc.L("Sounds", "Sonidos", "音效"), () => line.SoundOn = !line.SoundOn).Checked = line.SoundOn;
